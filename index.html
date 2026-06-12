@@ -110,7 +110,7 @@
     <span id="size-label">中</span>
   </div>
 
-  <div id="hint">🖐️ 张开手掌 → 菜单 | ✌️+☝️ 合拢 → 写字</div>
+  <div id="hint">🖐️ 手掌→菜单 | 🤏 拇指+食指捏合→写字 | 🤙 L形→消散 | ☝️☝️双食指→缩放</div>
   <div id="scale-indicator"></div>
 </div>
 
@@ -123,8 +123,9 @@ const CONFIG = {
   PALM_HOLD_FRAMES: 15,
   UI_DWELL_MS: 800,
   UI_COOLDOWN_MS: 1500,
-  INDEX_MIDDLE_TOGETHER_MAX_DIST: 0.06,
-  THUMB_INDEX_APART_MIN_DIST: 0.18,
+  THUMB_INDEX_TOGETHER_MAX_DIST: 0.06,   // 拇指食指捏合最大距离
+  THUMB_INDEX_APART_MIN_DIST: 0.18,       // 拇指食指张开最小距离
+  MOVE_GRAB_DIST: 40,                     // 抓取已有笔迹的距离阈值（屏幕像素）
   CANVAS_W: 640,
   CANVAS_H: 480,
   COLORS: ['#00d4ff','#ff2d55','#32d74b','#ffd60a','#af52de','#ffffff'],
@@ -135,7 +136,6 @@ const CONFIG = {
   SCALE_MIN: 0.3,
   SCALE_MAX: 3.0,
   MODEL_URL: './mediapipe/models/hand_landmarker.task',
-  // WASM URLs 在 initMediaPipe 中内联（多 CDN fallback）
 };
 
 // ═══════════════════════════════════════════
@@ -161,7 +161,10 @@ const state = {
   hoverTarget: null,
   hoverStartTime: 0,
   latestResults: null,
-  // 用于计算 FPS
+  // 移动笔迹
+  movingStrokes: [],        // 正在被移动的 Stroke ID 集合
+  moveStartWorld: null,     // 移动起始位置（世界坐标）
+  moveOriginalPoints: null, // 移动前的原始点（深拷贝）
   lastFrameTime: 0,
 };
 
@@ -233,12 +236,14 @@ function onlyTheseExtended(fs, fingers) {
 // ═══════════════════════════════════════════
 function classifyHandGesture(lm) {
   const fs = getFingerState(lm);
-  const dIndexMiddle = distBetween(lm, L.INDEX_TIP, L.MIDDLE_TIP);
   const dThumbIndex = distBetween(lm, L.THUMB_TIP, L.INDEX_TIP);
 
   if (countExtended(fs) === 5) return 'palm';
+  // 拇指+食指张开（L形）→ 消散
   if (onlyTheseExtended(fs, ['thumb','index']) && dThumbIndex > CONFIG.THUMB_INDEX_APART_MIN_DIST) return 'thumbIndexApart';
-  if (onlyTheseExtended(fs, ['index','middle']) && dIndexMiddle < CONFIG.INDEX_MIDDLE_TOGETHER_MAX_DIST) return 'indexMiddleTogether';
+  // 拇指+食指捏合 → 写字
+  if (onlyTheseExtended(fs, ['thumb','index']) && dThumbIndex < CONFIG.THUMB_INDEX_TOGETHER_MAX_DIST) return 'thumbIndexTogether';
+  // 仅食指伸出 → 指向
   if (onlyTheseExtended(fs, ['index'])) return 'indexPoint';
   return 'unknown';
 }
@@ -249,7 +254,7 @@ function classifyHandGesture(lm) {
 function updateGestureState(handGestures, results) {
   const now = performance.now();
   const palmDetected = handGestures.some(g => g === 'palm');
-  const writeDetected = handGestures.some(g => g === 'indexMiddleTogether');
+  const writeDetected = handGestures.some(g => g === 'thumbIndexTogether');
   const apartDetected = handGestures.some(g => g === 'thumbIndexApart');
   const pointDetected = handGestures.some(g => g === 'indexPoint');
 
@@ -295,6 +300,7 @@ function updateGestureState(handGestures, results) {
   } else if (pointDetected && state.uiOpen) {
     state.gesture = 'pointing';
   } else if (!state.uiOpen) {
+    if (state.movingStrokes.length > 0) finishMoving();
     state.gesture = 'idle';
   }
 }
@@ -321,6 +327,59 @@ function landmarkToCanvas(lm, idx) {
     x: lm[idx].x * canvas.width,
     y: lm[idx].y * canvas.height,
   };
+}
+
+// ═══════════════════════════════════════════
+// 查找附近的笔迹（用于移动）
+// ═══════════════════════════════════════════
+function findNearbyStrokes(screenX, screenY) {
+  const threshold = CONFIG.MOVE_GRAB_DIST * state.viewScale;
+  const ids = [];
+  for (const stroke of state.strokes) {
+    for (const pt of stroke.points) {
+      const ws = worldToScreen(pt.x, pt.y);
+      const dx = ws.x - screenX, dy = ws.y - screenY;
+      if (Math.sqrt(dx*dx + dy*dy) < threshold) {
+        ids.push(stroke.id);
+        break;
+      }
+    }
+  }
+  return ids;
+}
+
+function startMoving(ids, worldX, worldY) {
+  state.movingStrokes = ids;
+  state.moveStartWorld = { x: worldX, y: worldY };
+  // 深拷贝被移动笔迹的原始点
+  state.moveOriginalPoints = {};
+  for (const id of ids) {
+    const stroke = state.strokes.find(s => s.id === id);
+    if (stroke) {
+      state.moveOriginalPoints[id] = stroke.points.map(p => ({ x: p.x, y: p.y }));
+    }
+  }
+}
+
+function updateMoving(worldX, worldY) {
+  if (state.movingStrokes.length === 0 || !state.moveStartWorld) return;
+  const dx = worldX - state.moveStartWorld.x;
+  const dy = worldY - state.moveStartWorld.y;
+  for (const id of state.movingStrokes) {
+    const orig = state.moveOriginalPoints[id];
+    const stroke = state.strokes.find(s => s.id === id);
+    if (!stroke || !orig) continue;
+    for (let i = 0; i < stroke.points.length; i++) {
+      stroke.points[i].x = orig[i].x + dx;
+      stroke.points[i].y = orig[i].y + dy;
+    }
+  }
+}
+
+function finishMoving() {
+  state.movingStrokes = [];
+  state.moveStartWorld = null;
+  state.moveOriginalPoints = null;
 }
 
 // ═══════════════════════════════════════════
@@ -404,6 +463,11 @@ function drawAllStrokes() {
   ctx.scale(state.viewScale, state.viewScale);
 
   for (const stroke of state.strokes) {
+    // 被移动中的笔迹加高亮边框
+    if (state.movingStrokes.includes(stroke.id)) {
+      ctx.shadowColor = '#ffffff';
+      ctx.shadowBlur = 25;
+    }
     drawNeonStroke(stroke);
   }
   if (state.currentStroke && state.currentStroke.points.length >= 2) {
@@ -414,7 +478,7 @@ function drawAllStrokes() {
 }
 
 // ═══════════════════════════════════════════
-// 光标指示器 + 橡皮擦圆形
+// 光标指示器
 // ═══════════════════════════════════════════
 function drawCursor(pos) {
   ctx.save();
@@ -429,8 +493,15 @@ function drawCursor(pos) {
     ctx.setLineDash([]);
     ctx.fillStyle = 'rgba(255,255,255,0.08)';
     ctx.fill();
+  } else if (state.movingStrokes.length > 0) {
+    // 移动模式光标：手型图标
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = 0.5;
+    ctx.font = '20px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('✋', pos.x, pos.y);
+    ctx.globalAlpha = 1;
   } else {
-    // 笔光标：半透明小圆
     const r = CONFIG.SIZE_VALUES[state.sizeIdx] * s / 2 + 5;
     ctx.beginPath();
     ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
@@ -476,7 +547,6 @@ function computeUILayout() {
   const gap = 8;
   let cx = 50;
 
-  // 工具按钮
   for (const tool of TOOLS) {
     items.push({ type:'tool', key:tool.key, icon:tool.icon, label:tool.label,
       x:cx, y:panelY, w:68, h:52 });
@@ -484,7 +554,6 @@ function computeUILayout() {
   }
   cx += 16;
 
-  // 颜色
   for (let i = 0; i < CONFIG.COLORS.length; i++) {
     items.push({ type:'color', key:i, color:CONFIG.COLORS[i],
       x:cx, y:panelY, w:34, h:52 });
@@ -492,7 +561,6 @@ function computeUILayout() {
   }
   cx += 12;
 
-  // 大小
   for (let i = 0; i < CONFIG.SIZE_VALUES.length; i++) {
     items.push({ type:'size', key:i, size:CONFIG.SIZE_VALUES[i], label:CONFIG.SIZE_LABELS[i],
       x:cx, y:panelY, w:52, h:52 });
@@ -512,7 +580,6 @@ function renderUIPanel() {
   ctx.save();
   ctx.globalAlpha = alpha;
 
-  // 面板背景
   const totalW = buttons.length > 0 ? (buttons[buttons.length-1].x + buttons[buttons.length-1].w - buttons[0].x + 20) : 0;
   const panelX = buttons.length > 0 ? buttons[0].x - 10 : 0;
   const panelY = buttons.length > 0 ? buttons[0].y - 8 : 0;
@@ -529,7 +596,6 @@ function renderUIPanel() {
   roundRect(ctx, panelX, panelY, totalW, panelH, 18);
   ctx.stroke();
 
-  // 按钮
   for (const btn of buttons) {
     const isSelected = (
       (btn.type === 'tool' && btn.key === state.tool) ||
@@ -538,7 +604,6 @@ function renderUIPanel() {
     );
     const isHovered = state.hoverTarget?.type === btn.type && state.hoverTarget?.key === btn.key;
 
-    // 按钮背景
     if (isSelected) {
       ctx.fillStyle = 'rgba(0, 212, 255, 0.22)';
     } else if (isHovered) {
@@ -558,14 +623,13 @@ function renderUIPanel() {
       ctx.stroke();
     }
 
-    // 内容
-    const cx = btn.x + btn.w/2, cy = btn.y + btn.h/2;
+    const ccx = btn.x + btn.w/2, ccy = btn.y + btn.h/2;
     if (btn.type === 'color') {
       ctx.fillStyle = btn.color;
       ctx.shadowColor = btn.color;
       ctx.shadowBlur = 8;
       ctx.beginPath();
-      ctx.arc(cx, cy, 10, 0, Math.PI*2);
+      ctx.arc(ccx, ccy, 10, 0, Math.PI*2);
       ctx.fill();
       ctx.shadowBlur = 0;
     } else if (btn.type === 'size') {
@@ -573,22 +637,22 @@ function renderUIPanel() {
       ctx.font = '11px system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(btn.label, cx, cy - 6);
+      ctx.fillText(btn.label, ccx, ccy - 6);
       ctx.strokeStyle = state.color;
       ctx.lineWidth = btn.size;
       ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.moveTo(btn.x + 10, cy + 10);
-      ctx.lineTo(btn.x + btn.w - 10, cy + 10);
+      ctx.moveTo(btn.x + 10, ccy + 10);
+      ctx.lineTo(btn.x + btn.w - 10, ccy + 10);
       ctx.stroke();
     } else {
       ctx.fillStyle = '#e2e8f0';
       ctx.font = '20px system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(btn.icon, cx, cy - 6);
+      ctx.fillText(btn.icon, ccx, ccy - 6);
       ctx.font = '10px system-ui, sans-serif';
-      ctx.fillText(btn.label, cx, cy + 14);
+      ctx.fillText(btn.label, ccx, ccy + 14);
     }
   }
 
@@ -611,7 +675,6 @@ function renderUIPanel() {
   ctx.restore();
 }
 
-// 兼容旧版浏览器的 roundRect
 function roundRect(ctx, x, y, w, h, r) {
   if (ctx.roundRect) {
     ctx.roundRect(x, y, w, h, r);
@@ -658,7 +721,7 @@ function checkUIHover(fingerCanvasX, fingerCanvasY) {
       state.hoverStartTime = now;
     } else if (now - state.hoverStartTime >= CONFIG.UI_DWELL_MS) {
       applyUISelection(found);
-      state.hoverStartTime = now; // 重置防连发
+      state.hoverStartTime = now;
     }
   } else {
     state.hoverTarget = null;
@@ -688,7 +751,8 @@ function updateStatusBar() {
 // 粒子系统（雪花消散）
 // ═══════════════════════════════════════════
 function triggerDisperse() {
-  if (state.strokes.length === 0) return;
+  if (state.strokes.length === 0 && !state.currentStroke) return;
+  if (state.currentStroke) finishStroke();
 
   for (const stroke of state.strokes) {
     const sampleCount = Math.min(stroke.points.length, CONFIG.PARTICLES_PER_STROKE);
@@ -698,12 +762,10 @@ function triggerDisperse() {
       const pt = stroke.points[i];
       const screen = worldToScreen(pt.x, pt.y);
       state.particles.push({
-        x: screen.x,
-        y: screen.y,
+        x: screen.x, y: screen.y,
         vx: (Math.random() - 0.5) * 1.2,
         vy: 0.3 + Math.random() * 1.8,
-        life: 1,
-        decay: 0.004 + Math.random() * 0.012,
+        life: 1, decay: 0.004 + Math.random() * 0.012,
         size: 2 + Math.random() * 5,
         color: stroke.color,
         wobblePhase: Math.random() * Math.PI * 2,
@@ -714,6 +776,7 @@ function triggerDisperse() {
   }
   state.strokes = [];
   state.currentStroke = null;
+  state.movingStrokes = [];
 }
 
 function updateParticles() {
@@ -771,6 +834,7 @@ function handleScaling(results) {
 
   if (state.gesture !== 'scaling') {
     if (state.currentStroke) finishStroke();
+    if (state.movingStrokes.length > 0) finishMoving();
     state.gesture = 'scaling';
     state.pinchStartDist = currentDist;
     state.pinchStartScale = state.viewScale;
@@ -805,6 +869,7 @@ function processGestures(results) {
 
   if (!results?.landmarks || results.landmarks.length === 0) {
     if (state.currentStroke) finishStroke();
+    if (state.movingStrokes.length > 0) finishMoving();
     if (state.gesture !== 'dispersing') state.gesture = 'idle';
     return;
   }
@@ -823,27 +888,38 @@ function processGestures(results) {
     }
   }
 
-  // 写字 / 橡皮擦
+  // 写字 / 移动 / 橡皮擦
   if (state.gesture === 'writing') {
     for (let i = 0; i < results.landmarks.length; i++) {
-      if (handGestures[i] === 'indexMiddleTogether') {
+      if (handGestures[i] === 'thumbIndexTogether') {
         const lm = results.landmarks[i];
+        const thumbTip = landmarkToCanvas(lm, L.THUMB_TIP);
         const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
-        const midTip = landmarkToCanvas(lm, L.MIDDLE_TIP);
-        const mx = (idxTip.x + midTip.x) / 2;
-        const my = (idxTip.y + midTip.y) / 2;
+        const mx = (thumbTip.x + idxTip.x) / 2;
+        const my = (thumbTip.y + idxTip.y) / 2;
+        const worldPt = screenToWorld(mx, my);
 
         if (state.tool === 'eraser') {
           if (state.currentStroke) finishStroke();
+          if (state.movingStrokes.length > 0) finishMoving();
           eraseAt(mx, my);
+        } else if (state.movingStrokes.length > 0) {
+          // 继续移动已抓取的笔迹
+          updateMoving(worldPt.x, worldPt.y);
+        } else if (state.currentStroke) {
+          // 继续写字
+          const lastPt = state.currentStroke.points[state.currentStroke.points.length-1];
+          const d = Math.hypot(worldPt.x - lastPt.x, worldPt.y - lastPt.y);
+          if (d > 2) addPointToStroke(worldPt);
         } else {
-          const worldPt = screenToWorld(mx, my);
-          if (!state.currentStroke) {
-            startStroke(worldPt, state.color, CONFIG.SIZE_VALUES[state.sizeIdx], 'pen');
+          // 新捏合 → 判断是写字还是移动
+          const nearbyIds = findNearbyStrokes(mx, my);
+          if (nearbyIds.length > 0) {
+            // 抓取附近笔迹移动
+            startMoving(nearbyIds, worldPt.x, worldPt.y);
           } else {
-            const lastPt = state.currentStroke.points[state.currentStroke.points.length-1];
-            const d = Math.hypot(worldPt.x - lastPt.x, worldPt.y - lastPt.y);
-            if (d > 2) addPointToStroke(worldPt);
+            // 开始写字
+            startStroke(worldPt, state.color, CONFIG.SIZE_VALUES[state.sizeIdx], 'pen');
           }
         }
         break;
@@ -851,9 +927,9 @@ function processGestures(results) {
     }
   } else if (state.gesture !== 'scaling') {
     if (state.currentStroke && state.currentStroke.tool === 'pen') finishStroke();
+    if (state.movingStrokes.length > 0) finishMoving();
   }
 
-  // 缩放状态下的手指显示
   if (state.gesture === 'scaling' && results.landmarks.length === 2) {
     handleScaling(results);
   }
@@ -873,10 +949,12 @@ function updateHint() {
     scaleIndicator.textContent = `${state.viewScale.toFixed(1)}x`;
   } else if (state.uiOpen) {
     hintEl.textContent = '☝️ 食指悬停选择 | 🖐️ 张开手掌关闭菜单';
+  } else if (state.movingStrokes.length > 0) {
+    hintEl.textContent = '✋ 移动中... 松开捏合放下';
   } else if (state.gesture === 'writing') {
     hintEl.textContent = state.tool === 'eraser' ? '🧹 擦除中...' : '✍️ 写字中...';
   } else {
-    hintEl.textContent = '🖐️ 手掌→菜单 | ✌️+☝️ 合拢→写字 | 🤙 L形→消散 | ☝️☝️ 双食指→缩放';
+    hintEl.textContent = '🖐️ 手掌→菜单 | 🤏 拇指+食指捏合→写字/移动 | 🤙 L形→消散 | ☝️☝️ 双食指→缩放';
   }
 }
 
@@ -891,16 +969,16 @@ function render() {
   drawParticles();
   renderUIPanel();
 
-  // 画光标（当处于写字或指向状态时）
-  if (state.latestResults?.landmarks && (state.gesture === 'writing' || state.gesture === 'pointing')) {
+  // 画光标
+  if (state.latestResults?.landmarks && (state.gesture === 'writing' || state.gesture === 'pointing' || state.movingStrokes.length > 0)) {
     for (let i = 0; i < state.latestResults.landmarks.length; i++) {
       const g = classifyHandGesture(state.latestResults.landmarks[i]);
-      if (g === 'indexMiddleTogether' || g === 'indexPoint') {
+      if (g === 'thumbIndexTogether' || g === 'indexPoint') {
         const lm = state.latestResults.landmarks[i];
+        const thumbTip = landmarkToCanvas(lm, L.THUMB_TIP);
         const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
-        const midTip = landmarkToCanvas(lm, L.MIDDLE_TIP);
-        const mx = (idxTip.x + midTip.x) / 2;
-        const my = (idxTip.y + midTip.y) / 2;
+        const mx = (thumbTip.x + idxTip.x) / 2;
+        const my = (thumbTip.y + idxTip.y) / 2;
         drawCursor({ x: mx, y: my });
         break;
       }
@@ -917,8 +995,6 @@ let handLandmarker = null;
 
 async function initMediaPipe() {
   loadingText.textContent = '加载 JS 模块...';
-
-  // 从本地导入 ESM 模块
   const { HandLandmarker, FilesetResolver } = await import('./mediapipe/vision_bundle.mjs');
 
   loadingText.textContent = '加载 WASM 运行时...';
@@ -981,7 +1057,7 @@ document.addEventListener('keydown', (e) => {
   switch(e.key.toLowerCase()) {
     case 'p': state.tool = 'pen'; updateStatusBar(); break;
     case 'e': state.tool = 'eraser'; updateStatusBar(); break;
-    case 'c': state.strokes = []; state.particles = []; state.currentStroke = null; break;
+    case 'c': state.strokes = []; state.particles = []; state.currentStroke = null; state.movingStrokes = []; break;
     case '[': state.sizeIdx = Math.max(0, state.sizeIdx-1); updateStatusBar(); break;
     case ']': state.sizeIdx = Math.min(CONFIG.SIZE_VALUES.length-1, state.sizeIdx+1); updateStatusBar(); break;
     case '1': case '2': case '3': case '4': case '5': case '6':
@@ -995,11 +1071,7 @@ document.addEventListener('keydown', (e) => {
 // ═══════════════════════════════════════════
 // 响应式处理
 // ═══════════════════════════════════════════
-function handleResize() {
-  // Canvas 内部分辨率不变，CSS 自适应
-  // 无需额外处理
-}
-window.addEventListener('resize', handleResize);
+window.addEventListener('resize', () => {});
 
 // ═══════════════════════════════════════════
 // 启动
