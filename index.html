@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>隔空写字 — Air Writing</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: system-ui, -apple-system, sans-serif; }
+
+  #container {
+    position: relative; width: 100%; height: 100%; background: #000;
+  }
+
+  #video {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+
+  #canvas {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    transform: scaleX(-1);
+    pointer-events: none;
+  }
+
+  /* 加载遮罩 */
+  #loading {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.92); z-index: 100;
+    color: #fff; font-size: 16px;
+  }
+  #loading .spinner {
+    width: 48px; height: 48px;
+    border: 3px solid rgba(255,255,255,0.15);
+    border-top-color: #00d4ff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: 20px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading-text { color: #94a3b8; margin-top: 8px; font-size: 13px; }
+  #loading-retry {
+    margin-top: 16px; padding: 10px 28px;
+    background: rgba(0,212,255,0.2); border: 1px solid rgba(0,212,255,0.4);
+    color: #00d4ff; border-radius: 20px; cursor: pointer; font-size: 14px;
+    display: none;
+  }
+
+  /* 底部状态栏 */
+  #status-bar {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 14px; align-items: center;
+    background: rgba(15,23,42,0.82); backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 26px; padding: 10px 22px;
+    color: #e2e8f0; font-size: 13px; z-index: 50;
+    user-select: none; -webkit-user-select: none;
+  }
+  #status-bar .sep { width: 1px; height: 16px; background: rgba(255,255,255,0.15); }
+  #color-dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    box-shadow: 0 0 10px currentColor;
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+
+  /* 手势提示 */
+  #hint {
+    position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.7); font-size: 12px;
+    background: rgba(0,0,0,0.5); border-radius: 16px;
+    padding: 6px 16px; z-index: 50;
+    transition: opacity 0.4s;
+    user-select: none; -webkit-user-select: none;
+    pointer-events: none; white-space: nowrap;
+  }
+
+  /* 缩放指示器 */
+  #scale-indicator {
+    position: absolute; top: 56px; left: 50%; transform: translateX(-50%);
+    color: #00d4ff; font-size: 14px; font-weight: 600;
+    background: rgba(0,0,0,0.6); border-radius: 12px;
+    padding: 4px 14px; z-index: 50; display: none;
+    user-select: none; -webkit-user-select: none;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <span id="loading-text">正在初始化...</span>
+    <button id="loading-retry" onclick="location.reload()">重新加载</button>
+  </div>
+
+  <div id="status-bar">
+    <span id="tool-label">✏️ 笔</span>
+    <span class="sep"></span>
+    <div id="color-dot" style="background:#00d4ff;color:#00d4ff;"></div>
+    <span class="sep"></span>
+    <span id="size-label">中</span>
+  </div>
+
+  <div id="hint">🖐️ 张开手掌 → 菜单 | ✌️+☝️ 合拢 → 写字</div>
+  <div id="scale-indicator"></div>
+</div>
+
+<script type="module">
+// ═══════════════════════════════════════════
+// 配置常量
+// ═══════════════════════════════════════════
+const CONFIG = {
+  GESTURE_CONFIRM_FRAMES: 6,
+  PALM_HOLD_FRAMES: 15,
+  UI_DWELL_MS: 800,
+  UI_COOLDOWN_MS: 1500,
+  INDEX_MIDDLE_TOGETHER_MAX_DIST: 0.06,
+  THUMB_INDEX_APART_MIN_DIST: 0.18,
+  CANVAS_W: 640,
+  CANVAS_H: 480,
+  COLORS: ['#00d4ff','#ff2d55','#32d74b','#ffd60a','#af52de','#ffffff'],
+  SIZE_VALUES: [3, 6, 10],
+  SIZE_LABELS: ['细','中','粗'],
+  PARTICLES_PER_STROKE: 80,
+  ERASER_RADIUS: 25,
+  SCALE_MIN: 0.3,
+  SCALE_MAX: 3.0,
+  MODEL_URL: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+  WASM_URL: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
+};
+
+// ═══════════════════════════════════════════
+// 全局状态
+// ═══════════════════════════════════════════
+const state = {
+  tool: 'pen',
+  color: CONFIG.COLORS[0],
+  sizeIdx: 1,
+  uiOpen: false,
+  uiCooldownUntil: 0,
+  gesture: 'idle',
+  gestureFrames: {},
+  strokes: [],
+  particles: [],
+  currentStroke: null,
+  viewScale: 1,
+  viewOffsetX: 0,
+  viewOffsetY: 0,
+  pinchStartDist: 0,
+  pinchStartScale: 1,
+  pinchCenter: null,
+  hoverTarget: null,
+  hoverStartTime: 0,
+  latestResults: null,
+  // 用于计算 FPS
+  lastFrameTime: 0,
+};
+
+// ═══════════════════════════════════════════
+// Landmark 索引
+// ═══════════════════════════════════════════
+const L = {
+  WRIST:0, THUMB_CMC:1, THUMB_MCP:2, THUMB_IP:3, THUMB_TIP:4,
+  INDEX_MCP:5, INDEX_PIP:6, INDEX_DIP:7, INDEX_TIP:8,
+  MIDDLE_MCP:9, MIDDLE_PIP:10, MIDDLE_DIP:11, MIDDLE_TIP:12,
+  RING_MCP:13, RING_PIP:14, RING_DIP:15, RING_TIP:16,
+  PINKY_MCP:17, PINKY_PIP:18, PINKY_DIP:19, PINKY_TIP:20,
+};
+
+// ═══════════════════════════════════════════
+// DOM 引用
+// ═══════════════════════════════════════════
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const loadingEl = document.getElementById('loading');
+const loadingText = document.getElementById('loading-text');
+const loadingRetry = document.getElementById('loading-retry');
+const toolLabel = document.getElementById('tool-label');
+const colorDot = document.getElementById('color-dot');
+const sizeLabel = document.getElementById('size-label');
+const hintEl = document.getElementById('hint');
+const scaleIndicator = document.getElementById('scale-indicator');
+
+// ═══════════════════════════════════════════
+// 手指检测工具函数
+// ═══════════════════════════════════════════
+function isFingerExtended(lm, tipIdx, pipIdx) {
+  return lm[tipIdx].y < lm[pipIdx].y;
+}
+
+function isThumbExtended(lm) {
+  const tip = lm[L.THUMB_TIP], ip = lm[L.THUMB_IP], wrist = lm[L.WRIST];
+  const tipDist = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+  const ipDist = Math.hypot(ip.x - wrist.x, ip.y - wrist.y);
+  return tipDist > ipDist * 1.05;
+}
+
+function distBetween(lm, i1, i2) {
+  return Math.hypot(lm[i1].x - lm[i2].x, lm[i1].y - lm[i2].y);
+}
+
+function getFingerState(lm) {
+  return {
+    thumb: isThumbExtended(lm),
+    index: isFingerExtended(lm, L.INDEX_TIP, L.INDEX_PIP),
+    middle: isFingerExtended(lm, L.MIDDLE_TIP, L.MIDDLE_PIP),
+    ring: isFingerExtended(lm, L.RING_TIP, L.RING_PIP),
+    pinky: isFingerExtended(lm, L.PINKY_TIP, L.PINKY_PIP),
+  };
+}
+
+function countExtended(fs) {
+  return (fs.thumb?1:0)+(fs.index?1:0)+(fs.middle?1:0)+(fs.ring?1:0)+(fs.pinky?1:0);
+}
+
+function onlyTheseExtended(fs, fingers) {
+  const all = ['thumb','index','middle','ring','pinky'];
+  return all.every(f => fingers.includes(f) ? fs[f] : !fs[f]);
+}
+
+// ═══════════════════════════════════════════
+// 单只手势分类
+// ═══════════════════════════════════════════
+function classifyHandGesture(lm) {
+  const fs = getFingerState(lm);
+  const dIndexMiddle = distBetween(lm, L.INDEX_TIP, L.MIDDLE_TIP);
+  const dThumbIndex = distBetween(lm, L.THUMB_TIP, L.INDEX_TIP);
+
+  if (countExtended(fs) === 5) return 'palm';
+  if (onlyTheseExtended(fs, ['thumb','index']) && dThumbIndex > CONFIG.THUMB_INDEX_APART_MIN_DIST) return 'thumbIndexApart';
+  if (onlyTheseExtended(fs, ['index','middle']) && dIndexMiddle < CONFIG.INDEX_MIDDLE_TOGETHER_MAX_DIST) return 'indexMiddleTogether';
+  if (onlyTheseExtended(fs, ['index'])) return 'indexPoint';
+  return 'unknown';
+}
+
+// ═══════════════════════════════════════════
+// 手势状态机
+// ═══════════════════════════════════════════
+function updateGestureState(handGestures, results) {
+  const now = performance.now();
+  const palmDetected = handGestures.some(g => g === 'palm');
+  const writeDetected = handGestures.some(g => g === 'indexMiddleTogether');
+  const apartDetected = handGestures.some(g => g === 'thumbIndexApart');
+  const pointDetected = handGestures.some(g => g === 'indexPoint');
+
+  // 双手各伸食指 → 缩放（在 processGestures 中优先处理）
+  const twoHandsIndex = results.handedness?.length === 2
+    && handGestures.length === 2
+    && handGestures[0] === 'indexPoint'
+    && handGestures[1] === 'indexPoint';
+
+  // 手掌 → 切换 UI
+  if (palmDetected && !twoHandsIndex) {
+    state.gestureFrames['palm'] = (state.gestureFrames['palm']||0) + 1;
+    if (state.gestureFrames['palm'] >= CONFIG.PALM_HOLD_FRAMES && now > state.uiCooldownUntil) {
+      state.uiOpen = !state.uiOpen;
+      state.uiCooldownUntil = now + CONFIG.UI_COOLDOWN_MS;
+      state.gestureFrames['palm'] = 0;
+      state.hoverTarget = null;
+      state.hoverStartTime = 0;
+      if (!state.uiOpen) state.gestureFrames['palm'] = 0;
+    }
+  } else {
+    state.gestureFrames['palm'] = 0;
+  }
+
+  // 拇指+食指张开 → 消散
+  if (apartDetected && !state.uiOpen) {
+    state.gestureFrames['apart'] = (state.gestureFrames['apart']||0) + 1;
+    if (state.gestureFrames['apart'] >= CONFIG.GESTURE_CONFIRM_FRAMES && state.strokes.length > 0) {
+      triggerDisperse();
+      state.gestureFrames['apart'] = 0;
+    }
+  } else {
+    state.gestureFrames['apart'] = 0;
+  }
+
+  // 确定最终手势
+  if (state.particles.length > 0) {
+    state.gesture = 'dispersing';
+  } else if (twoHandsIndex) {
+    // 由 handleScaling 接管
+  } else if (writeDetected && !state.uiOpen) {
+    state.gesture = 'writing';
+  } else if (pointDetected && state.uiOpen) {
+    state.gesture = 'pointing';
+  } else if (!state.uiOpen) {
+    state.gesture = 'idle';
+  }
+}
+
+// ═══════════════════════════════════════════
+// 坐标转换
+// ═══════════════════════════════════════════
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - state.viewOffsetX) / state.viewScale,
+    y: (sy - state.viewOffsetY) / state.viewScale,
+  };
+}
+
+function worldToScreen(wx, wy) {
+  return {
+    x: wx * state.viewScale + state.viewOffsetX,
+    y: wy * state.viewScale + state.viewOffsetY,
+  };
+}
+
+function landmarkToCanvas(lm, idx) {
+  return {
+    x: lm[idx].x * canvas.width,
+    y: lm[idx].y * canvas.height,
+  };
+}
+
+// ═══════════════════════════════════════════
+// Stroke 管理
+// ═══════════════════════════════════════════
+let strokeIdCounter = 0;
+
+function startStroke(point, color, size, tool) {
+  state.currentStroke = {
+    id: strokeIdCounter++,
+    points: [point],
+    color,
+    size,
+    tool,
+  };
+}
+
+function addPointToStroke(point) {
+  if (state.currentStroke) {
+    state.currentStroke.points.push(point);
+  }
+}
+
+function finishStroke() {
+  if (state.currentStroke && state.currentStroke.points.length > 1) {
+    state.strokes.push(state.currentStroke);
+  }
+  state.currentStroke = null;
+}
+
+// ═══════════════════════════════════════════
+// 霓虹笔迹渲染
+// ═══════════════════════════════════════════
+function drawNeonStroke(stroke) {
+  if (stroke.points.length < 2) return;
+
+  const pts = stroke.points;
+  const size = stroke.size;
+
+  // 外层发光
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 2) {
+    ctx.lineTo(pts[1].x, pts[1].y);
+  } else {
+    for (let i = 2; i < pts.length; i++) {
+      const cx = (pts[i-1].x + pts[i].x) / 2;
+      const cy = (pts[i-1].y + pts[i].y) / 2;
+      ctx.quadraticCurveTo(pts[i-1].x, pts[i-1].y, cx, cy);
+    }
+    ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+  }
+  ctx.strokeStyle = stroke.color;
+  ctx.lineWidth = size + 8;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = stroke.color;
+  ctx.shadowBlur = 18;
+  ctx.globalAlpha = 0.35;
+  ctx.stroke();
+
+  // 中层
+  ctx.shadowBlur = 8;
+  ctx.globalAlpha = 0.65;
+  ctx.lineWidth = size + 3;
+  ctx.stroke();
+
+  // 内层实线
+  ctx.shadowBlur = 3;
+  ctx.globalAlpha = 0.95;
+  ctx.lineWidth = size;
+  ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
+}
+
+function drawAllStrokes() {
+  ctx.save();
+  ctx.translate(state.viewOffsetX, state.viewOffsetY);
+  ctx.scale(state.viewScale, state.viewScale);
+
+  for (const stroke of state.strokes) {
+    drawNeonStroke(stroke);
+  }
+  if (state.currentStroke && state.currentStroke.points.length >= 2) {
+    drawNeonStroke(state.currentStroke);
+  }
+
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════
+// 光标指示器 + 橡皮擦圆形
+// ═══════════════════════════════════════════
+function drawCursor(pos) {
+  ctx.save();
+  const s = state.viewScale;
+  if (state.tool === 'eraser') {
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, CONFIG.ERASER_RADIUS * s, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fill();
+  } else {
+    // 笔光标：半透明小圆
+    const r = CONFIG.SIZE_VALUES[state.sizeIdx] * s / 2 + 5;
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
+    ctx.fillStyle = state.color;
+    ctx.globalAlpha = 0.2;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════
+// 橡皮擦
+// ═══════════════════════════════════════════
+function eraseAt(ex, ey) {
+  const threshold = CONFIG.ERASER_RADIUS * state.viewScale;
+  for (let i = state.strokes.length - 1; i >= 0; i--) {
+    const stroke = state.strokes[i];
+    for (const pt of stroke.points) {
+      const ws = worldToScreen(pt.x, pt.y);
+      const dx = ws.x - ex, dy = ws.y - ey;
+      if (Math.sqrt(dx*dx + dy*dy) < threshold) {
+        state.strokes.splice(i, 1);
+        break;
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════
+// UI 面板
+// ═══════════════════════════════════════════
+const TOOLS = [
+  { key: 'pen', icon: '✏️', label: '笔' },
+  { key: 'eraser', icon: '🧹', label: '橡皮' },
+];
+
+let uiAnimProgress = 0;
+
+function computeUILayout() {
+  const items = [];
+  const panelY = 60;
+  const gap = 8;
+  let cx = 50;
+
+  // 工具按钮
+  for (const tool of TOOLS) {
+    items.push({ type:'tool', key:tool.key, icon:tool.icon, label:tool.label,
+      x:cx, y:panelY, w:68, h:52 });
+    cx += 68 + gap;
+  }
+  cx += 16;
+
+  // 颜色
+  for (let i = 0; i < CONFIG.COLORS.length; i++) {
+    items.push({ type:'color', key:i, color:CONFIG.COLORS[i],
+      x:cx, y:panelY, w:34, h:52 });
+    cx += 34 + 4;
+  }
+  cx += 12;
+
+  // 大小
+  for (let i = 0; i < CONFIG.SIZE_VALUES.length; i++) {
+    items.push({ type:'size', key:i, size:CONFIG.SIZE_VALUES[i], label:CONFIG.SIZE_LABELS[i],
+      x:cx, y:panelY, w:52, h:52 });
+    cx += 52 + gap;
+  }
+
+  return items;
+}
+
+function renderUIPanel() {
+  const buttons = computeUILayout();
+  const targetAlpha = state.uiOpen ? 1 : 0;
+  uiAnimProgress += (targetAlpha - uiAnimProgress) * 0.15;
+  if (uiAnimProgress < 0.005) return;
+
+  const alpha = uiAnimProgress;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // 面板背景
+  const totalW = buttons.length > 0 ? (buttons[buttons.length-1].x + buttons[buttons.length-1].w - buttons[0].x + 20) : 0;
+  const panelX = buttons.length > 0 ? buttons[0].x - 10 : 0;
+  const panelY = buttons.length > 0 ? buttons[0].y - 8 : 0;
+  const panelH = 68;
+
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+  ctx.beginPath();
+  roundRect(ctx, panelX, panelY, totalW, panelH, 18);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  roundRect(ctx, panelX, panelY, totalW, panelH, 18);
+  ctx.stroke();
+
+  // 按钮
+  for (const btn of buttons) {
+    const isSelected = (
+      (btn.type === 'tool' && btn.key === state.tool) ||
+      (btn.type === 'color' && CONFIG.COLORS[btn.key] === state.color) ||
+      (btn.type === 'size' && btn.key === state.sizeIdx)
+    );
+    const isHovered = state.hoverTarget?.type === btn.type && state.hoverTarget?.key === btn.key;
+
+    // 按钮背景
+    if (isSelected) {
+      ctx.fillStyle = 'rgba(0, 212, 255, 0.22)';
+    } else if (isHovered) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+    } else {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.04)';
+    }
+    ctx.beginPath();
+    roundRect(ctx, btn.x, btn.y, btn.w, btn.h, 12);
+    ctx.fill();
+
+    if (isSelected) {
+      ctx.strokeStyle = 'rgba(0, 212, 255, 0.55)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      roundRect(ctx, btn.x, btn.y, btn.w, btn.h, 12);
+      ctx.stroke();
+    }
+
+    // 内容
+    const cx = btn.x + btn.w/2, cy = btn.y + btn.h/2;
+    if (btn.type === 'color') {
+      ctx.fillStyle = btn.color;
+      ctx.shadowColor = btn.color;
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI*2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    } else if (btn.type === 'size') {
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(btn.label, cx, cy - 6);
+      ctx.strokeStyle = state.color;
+      ctx.lineWidth = btn.size;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(btn.x + 10, cy + 10);
+      ctx.lineTo(btn.x + btn.w - 10, cy + 10);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(btn.icon, cx, cy - 6);
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.fillText(btn.label, cx, cy + 14);
+    }
+  }
+
+  // 悬停进度环
+  if (state.hoverTarget && state.hoverStartTime > 0 && state.uiOpen) {
+    const elapsed = performance.now() - state.hoverStartTime;
+    const progress = Math.min(elapsed / CONFIG.UI_DWELL_MS, 1);
+    const btn = buttons.find(b => b.type === state.hoverTarget.type && b.key === state.hoverTarget.key);
+    if (btn) {
+      const bccx = btn.x + btn.w/2, bccy = btn.y + btn.h/2;
+      const r = Math.max(btn.w, btn.h)/2 + 5;
+      ctx.strokeStyle = state.color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(bccx, bccy, r, -Math.PI/2, -Math.PI/2 + progress*Math.PI*2);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
+// 兼容旧版浏览器的 roundRect
+function roundRect(ctx, x, y, w, h, r) {
+  if (ctx.roundRect) {
+    ctx.roundRect(x, y, w, h, r);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.lineTo(x+w-r, y);
+    ctx.arcTo(x+w, y, x+w, y+r, r);
+    ctx.lineTo(x+w, y+h-r);
+    ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
+    ctx.lineTo(x+r, y+h);
+    ctx.arcTo(x, y+h, x, y+h-r, r);
+    ctx.lineTo(x, y+r);
+    ctx.arcTo(x, y, x+r, y, r);
+    ctx.closePath();
+  }
+}
+
+// ═══════════════════════════════════════════
+// UI 悬停检测和选择
+// ═══════════════════════════════════════════
+function checkUIHover(fingerCanvasX, fingerCanvasY) {
+  if (!state.uiOpen || uiAnimProgress < 0.5) {
+    state.hoverTarget = null;
+    state.hoverStartTime = 0;
+    return;
+  }
+
+  const buttons = computeUILayout();
+  const now = performance.now();
+  let found = null;
+
+  for (const btn of buttons) {
+    if (fingerCanvasX >= btn.x && fingerCanvasX <= btn.x+btn.w &&
+        fingerCanvasY >= btn.y && fingerCanvasY <= btn.y+btn.h) {
+      found = btn;
+      break;
+    }
+  }
+
+  if (found) {
+    if (!state.hoverTarget || state.hoverTarget.type !== found.type || state.hoverTarget.key !== found.key) {
+      state.hoverTarget = found;
+      state.hoverStartTime = now;
+    } else if (now - state.hoverStartTime >= CONFIG.UI_DWELL_MS) {
+      applyUISelection(found);
+      state.hoverStartTime = now; // 重置防连发
+    }
+  } else {
+    state.hoverTarget = null;
+    state.hoverStartTime = 0;
+  }
+}
+
+function applyUISelection(btn) {
+  if (btn.type === 'tool') {
+    state.tool = btn.key;
+  } else if (btn.type === 'color') {
+    state.color = CONFIG.COLORS[btn.key];
+  } else if (btn.type === 'size') {
+    state.sizeIdx = btn.key;
+  }
+  updateStatusBar();
+}
+
+function updateStatusBar() {
+  toolLabel.textContent = state.tool === 'pen' ? '✏️ 笔' : '🧹 橡皮';
+  colorDot.style.background = state.color;
+  colorDot.style.color = state.color;
+  sizeLabel.textContent = CONFIG.SIZE_LABELS[state.sizeIdx];
+}
+
+// ═══════════════════════════════════════════
+// 粒子系统（雪花消散）
+// ═══════════════════════════════════════════
+function triggerDisperse() {
+  if (state.strokes.length === 0) return;
+
+  for (const stroke of state.strokes) {
+    const sampleCount = Math.min(stroke.points.length, CONFIG.PARTICLES_PER_STROKE);
+    const step = Math.max(1, Math.floor(stroke.points.length / sampleCount));
+
+    for (let i = 0; i < stroke.points.length; i += step) {
+      const pt = stroke.points[i];
+      const screen = worldToScreen(pt.x, pt.y);
+      state.particles.push({
+        x: screen.x,
+        y: screen.y,
+        vx: (Math.random() - 0.5) * 1.2,
+        vy: 0.3 + Math.random() * 1.8,
+        life: 1,
+        decay: 0.004 + Math.random() * 0.012,
+        size: 2 + Math.random() * 5,
+        color: stroke.color,
+        wobblePhase: Math.random() * Math.PI * 2,
+        wobbleSpeed: 0.03 + Math.random() * 0.05,
+        wobbleAmp: 0.3 + Math.random() * 0.9,
+      });
+    }
+  }
+  state.strokes = [];
+  state.currentStroke = null;
+}
+
+function updateParticles() {
+  for (let i = state.particles.length - 1; i >= 0; i--) {
+    const p = state.particles[i];
+    p.life -= p.decay;
+    p.y += p.vy;
+    p.x += p.vx + Math.sin(p.wobblePhase) * p.wobbleAmp;
+    p.wobblePhase += p.wobbleSpeed;
+    p.vy += 0.025;
+    p.size *= 0.997;
+    if (p.life <= 0) state.particles.splice(i, 1);
+  }
+  if (state.particles.length === 0 && state.gesture === 'dispersing') {
+    state.gesture = 'idle';
+  }
+}
+
+function drawParticles() {
+  for (const p of state.particles) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(0.5, p.size), 0, Math.PI*2);
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = p.life * 0.7;
+    ctx.shadowColor = p.color;
+    ctx.shadowBlur = 5;
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
+}
+
+// ═══════════════════════════════════════════
+// 双手缩放
+// ═══════════════════════════════════════════
+function handleScaling(results) {
+  if (!results?.landmarks || results.landmarks.length !== 2) {
+    if (state.gesture === 'scaling') state.gesture = 'idle';
+    return;
+  }
+  if (results.handedness?.length !== 2) return;
+
+  const h0 = results.landmarks[0], h1 = results.landmarks[1];
+  const g0 = classifyHandGesture(h0), g1 = classifyHandGesture(h1);
+  if (g0 !== 'indexPoint' || g1 !== 'indexPoint') {
+    if (state.gesture === 'scaling') state.gesture = 'idle';
+    return;
+  }
+
+  const tip0 = landmarkToCanvas(h0, L.INDEX_TIP);
+  const tip1 = landmarkToCanvas(h1, L.INDEX_TIP);
+  const currentDist = Math.hypot(tip1.x - tip0.x, tip1.y - tip0.y);
+  const cx = (tip0.x + tip1.x) / 2;
+  const cy = (tip0.y + tip1.y) / 2;
+
+  if (state.gesture !== 'scaling') {
+    if (state.currentStroke) finishStroke();
+    state.gesture = 'scaling';
+    state.pinchStartDist = currentDist;
+    state.pinchStartScale = state.viewScale;
+    state.pinchCenter = { x: cx, y: cy };
+    return;
+  }
+
+  if (state.pinchStartDist > 10) {
+    let newScale = state.pinchStartScale * (currentDist / state.pinchStartDist);
+    newScale = Math.max(CONFIG.SCALE_MIN, Math.min(CONFIG.SCALE_MAX, newScale));
+    const pc = state.pinchCenter;
+    state.viewOffsetX = pc.x - (pc.x - state.viewOffsetX) * (newScale / state.viewScale);
+    state.viewOffsetY = pc.y - (pc.y - state.viewOffsetY) * (newScale / state.viewScale);
+    state.viewScale = newScale;
+  }
+}
+
+// ═══════════════════════════════════════════
+// 手势→动作映射
+// ═══════════════════════════════════════════
+function processGestures(results) {
+  state.latestResults = results;
+
+  // 双手缩放（最高优先级）
+  if (results?.landmarks?.length === 2) {
+    const h0 = results.landmarks[0], h1 = results.landmarks[1];
+    if (classifyHandGesture(h0) === 'indexPoint' && classifyHandGesture(h1) === 'indexPoint') {
+      handleScaling(results);
+      if (state.gesture === 'scaling') return;
+    }
+  }
+
+  if (!results?.landmarks || results.landmarks.length === 0) {
+    if (state.currentStroke) finishStroke();
+    if (state.gesture !== 'dispersing') state.gesture = 'idle';
+    return;
+  }
+
+  const handGestures = results.landmarks.map(lm => classifyHandGesture(lm));
+  updateGestureState(handGestures, results);
+
+  // 食指指向（UI 选择）
+  if (state.gesture === 'pointing') {
+    for (let i = 0; i < results.landmarks.length; i++) {
+      if (handGestures[i] === 'indexPoint') {
+        const tip = landmarkToCanvas(results.landmarks[i], L.INDEX_TIP);
+        checkUIHover(tip.x, tip.y);
+        break;
+      }
+    }
+  }
+
+  // 写字 / 橡皮擦
+  if (state.gesture === 'writing') {
+    for (let i = 0; i < results.landmarks.length; i++) {
+      if (handGestures[i] === 'indexMiddleTogether') {
+        const lm = results.landmarks[i];
+        const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
+        const midTip = landmarkToCanvas(lm, L.MIDDLE_TIP);
+        const mx = (idxTip.x + midTip.x) / 2;
+        const my = (idxTip.y + midTip.y) / 2;
+
+        if (state.tool === 'eraser') {
+          if (state.currentStroke) finishStroke();
+          eraseAt(mx, my);
+        } else {
+          const worldPt = screenToWorld(mx, my);
+          if (!state.currentStroke) {
+            startStroke(worldPt, state.color, CONFIG.SIZE_VALUES[state.sizeIdx], 'pen');
+          } else {
+            const lastPt = state.currentStroke.points[state.currentStroke.points.length-1];
+            const d = Math.hypot(worldPt.x - lastPt.x, worldPt.y - lastPt.y);
+            if (d > 2) addPointToStroke(worldPt);
+          }
+        }
+        break;
+      }
+    }
+  } else if (state.gesture !== 'scaling') {
+    if (state.currentStroke && state.currentStroke.tool === 'pen') finishStroke();
+  }
+
+  // 缩放状态下的手指显示
+  if (state.gesture === 'scaling' && results.landmarks.length === 2) {
+    handleScaling(results);
+  }
+}
+
+// ═══════════════════════════════════════════
+// 提示和指示器更新
+// ═══════════════════════════════════════════
+function updateHint() {
+  scaleIndicator.style.display = 'none';
+
+  if (state.particles.length > 0) {
+    hintEl.textContent = '❄️ 雪花消散中...';
+  } else if (state.gesture === 'scaling') {
+    hintEl.textContent = '🔍 缩放中...';
+    scaleIndicator.style.display = 'block';
+    scaleIndicator.textContent = `${state.viewScale.toFixed(1)}x`;
+  } else if (state.uiOpen) {
+    hintEl.textContent = '☝️ 食指悬停选择 | 🖐️ 张开手掌关闭菜单';
+  } else if (state.gesture === 'writing') {
+    hintEl.textContent = state.tool === 'eraser' ? '🧹 擦除中...' : '✍️ 写字中...';
+  } else {
+    hintEl.textContent = '🖐️ 手掌→菜单 | ✌️+☝️ 合拢→写字 | 🤙 L形→消散 | ☝️☝️ 双食指→缩放';
+  }
+}
+
+// ═══════════════════════════════════════════
+// 主渲染
+// ═══════════════════════════════════════════
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  updateParticles();
+  drawAllStrokes();
+  drawParticles();
+  renderUIPanel();
+
+  // 画光标（当处于写字或指向状态时）
+  if (state.latestResults?.landmarks && (state.gesture === 'writing' || state.gesture === 'pointing')) {
+    for (let i = 0; i < state.latestResults.landmarks.length; i++) {
+      const g = classifyHandGesture(state.latestResults.landmarks[i]);
+      if (g === 'indexMiddleTogether' || g === 'indexPoint') {
+        const lm = state.latestResults.landmarks[i];
+        const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
+        const midTip = landmarkToCanvas(lm, L.MIDDLE_TIP);
+        const mx = (idxTip.x + midTip.x) / 2;
+        const my = (idxTip.y + midTip.y) / 2;
+        drawCursor({ x: mx, y: my });
+        break;
+      }
+    }
+  }
+
+  updateHint();
+}
+
+// ═══════════════════════════════════════════
+// MediaPipe 初始化
+// ═══════════════════════════════════════════
+let handLandmarker = null;
+
+async function initMediaPipe() {
+  loadingText.textContent = '加载 WASM 运行时...';
+  const module = await import(
+    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/hand_landmarker/hand_landmarker.js`
+  );
+  const { FilesetResolver, HandLandmarker } = module;
+
+  loadingText.textContent = '加载手势识别模型...';
+  const vision = await FilesetResolver.forVisionTasks(CONFIG.WASM_URL);
+
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: CONFIG.MODEL_URL,
+      delegate: 'GPU',
+    },
+    runningMode: 'VIDEO',
+    numHands: 2,
+    minHandDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.5,
+  });
+}
+
+// ═══════════════════════════════════════════
+// 摄像头启动
+// ═══════════════════════════════════════════
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+    audio: false,
+  });
+  video.srcObject = stream;
+
+  return new Promise((resolve) => {
+    video.onloadedmetadata = () => {
+      canvas.width = CONFIG.CANVAS_W;
+      canvas.height = CONFIG.CANVAS_H;
+      video.play();
+      resolve();
+    };
+  });
+}
+
+// ═══════════════════════════════════════════
+// 主循环
+// ═══════════════════════════════════════════
+async function loop() {
+  if (handLandmarker && video.readyState >= 2) {
+    try {
+      const results = await handLandmarker.detectForVideo(video, performance.now());
+      processGestures(results);
+    } catch (e) {
+      // 偶发性检测错误忽略
+    }
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ═══════════════════════════════════════════
+// 键盘快捷键
+// ═══════════════════════════════════════════
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  switch(e.key.toLowerCase()) {
+    case 'p': state.tool = 'pen'; updateStatusBar(); break;
+    case 'e': state.tool = 'eraser'; updateStatusBar(); break;
+    case 'c': state.strokes = []; state.particles = []; state.currentStroke = null; break;
+    case '[': state.sizeIdx = Math.max(0, state.sizeIdx-1); updateStatusBar(); break;
+    case ']': state.sizeIdx = Math.min(CONFIG.SIZE_VALUES.length-1, state.sizeIdx+1); updateStatusBar(); break;
+    case '1': case '2': case '3': case '4': case '5': case '6':
+      state.color = CONFIG.COLORS[parseInt(e.key)-1]; updateStatusBar(); break;
+    case '0':
+      state.viewScale = 1; state.viewOffsetX = 0; state.viewOffsetY = 0;
+      state.pinchStartDist = 0; state.gesture = 'idle'; break;
+  }
+});
+
+// ═══════════════════════════════════════════
+// 响应式处理
+// ═══════════════════════════════════════════
+function handleResize() {
+  // Canvas 内部分辨率不变，CSS 自适应
+  // 无需额外处理
+}
+window.addEventListener('resize', handleResize);
+
+// ═══════════════════════════════════════════
+// 启动
+// ═══════════════════════════════════════════
+async function main() {
+  try {
+    loadingText.textContent = '初始化中...';
+    await initMediaPipe();
+    loadingText.textContent = '启动摄像头...';
+    await startCamera();
+    loadingEl.style.display = 'none';
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error('启动失败:', err);
+    loadingText.textContent = `启动失败: ${err.message || '未知错误'}`;
+    loadingRetry.style.display = 'block';
+    if (err.name === 'NotAllowedError') {
+      loadingText.textContent = '请允许摄像头权限后刷新页面';
+    } else if (err.name === 'NotFoundError') {
+      loadingText.textContent = '未检测到摄像头';
+    }
+  }
+}
+main();
+</script>
+</body>
+</html>
