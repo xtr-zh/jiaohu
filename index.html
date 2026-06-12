@@ -110,7 +110,7 @@
     <span id="size-label">中</span>
   </div>
 
-  <div id="hint">🖐️ 手掌→菜单 | 🤏 拇指+食指捏合→写字 | 🤙 L形→消散 | ☝️☝️双食指→缩放</div>
+  <div id="hint">🖐️ 手掌→菜单 | ☝️ 食指→写字 | 🤏 捏合→移动 | 🤙 L形→消散 | 🤏🤏 双手捏合→缩放</div>
   <div id="scale-indicator"></div>
 </div>
 
@@ -254,18 +254,18 @@ function classifyHandGesture(lm) {
 function updateGestureState(handGestures, results) {
   const now = performance.now();
   const palmDetected = handGestures.some(g => g === 'palm');
-  const writeDetected = handGestures.some(g => g === 'thumbIndexTogether');
+  const writeDetected = handGestures.some(g => g === 'indexPoint');
+  const moveDetected = handGestures.some(g => g === 'thumbIndexTogether');
   const apartDetected = handGestures.some(g => g === 'thumbIndexApart');
-  const pointDetected = handGestures.some(g => g === 'indexPoint');
 
-  // 双手各伸食指 → 缩放（在 processGestures 中优先处理）
-  const twoHandsIndex = results.handedness?.length === 2
+  // 双手捏合 → 缩放（在 processGestures 中优先处理）
+  const twoHandsPinch = results.handedness?.length === 2
     && handGestures.length === 2
-    && handGestures[0] === 'indexPoint'
-    && handGestures[1] === 'indexPoint';
+    && handGestures[0] === 'thumbIndexTogether'
+    && handGestures[1] === 'thumbIndexTogether';
 
   // 手掌 → 切换 UI
-  if (palmDetected && !twoHandsIndex) {
+  if (palmDetected && !twoHandsPinch) {
     state.gestureFrames['palm'] = (state.gestureFrames['palm']||0) + 1;
     if (state.gestureFrames['palm'] >= CONFIG.PALM_HOLD_FRAMES && now > state.uiCooldownUntil) {
       state.uiOpen = !state.uiOpen;
@@ -293,13 +293,16 @@ function updateGestureState(handGestures, results) {
   // 确定最终手势
   if (state.particles.length > 0) {
     state.gesture = 'dispersing';
-  } else if (twoHandsIndex) {
+  } else if (twoHandsPinch) {
     // 由 handleScaling 接管
+  } else if (moveDetected && !state.uiOpen) {
+    state.gesture = 'moving';
   } else if (writeDetected && !state.uiOpen) {
     state.gesture = 'writing';
-  } else if (pointDetected && state.uiOpen) {
+  } else if (writeDetected && state.uiOpen) {
     state.gesture = 'pointing';
   } else if (!state.uiOpen) {
+    if (state.currentStroke) finishStroke();
     if (state.movingStrokes.length > 0) finishMoving();
     state.gesture = 'idle';
   }
@@ -810,7 +813,7 @@ function drawParticles() {
 }
 
 // ═══════════════════════════════════════════
-// 双手缩放
+// 双手捏合缩放
 // ═══════════════════════════════════════════
 function handleScaling(results) {
   if (!results?.landmarks || results.landmarks.length !== 2) {
@@ -821,16 +824,19 @@ function handleScaling(results) {
 
   const h0 = results.landmarks[0], h1 = results.landmarks[1];
   const g0 = classifyHandGesture(h0), g1 = classifyHandGesture(h1);
-  if (g0 !== 'indexPoint' || g1 !== 'indexPoint') {
+  if (g0 !== 'thumbIndexTogether' || g1 !== 'thumbIndexTogether') {
     if (state.gesture === 'scaling') state.gesture = 'idle';
     return;
   }
 
-  const tip0 = landmarkToCanvas(h0, L.INDEX_TIP);
-  const tip1 = landmarkToCanvas(h1, L.INDEX_TIP);
-  const currentDist = Math.hypot(tip1.x - tip0.x, tip1.y - tip0.y);
-  const cx = (tip0.x + tip1.x) / 2;
-  const cy = (tip0.y + tip1.y) / 2;
+  // 两个捏合中点之间的距离
+  const p0x = (landmarkToCanvas(h0, L.THUMB_TIP).x + landmarkToCanvas(h0, L.INDEX_TIP).x) / 2;
+  const p0y = (landmarkToCanvas(h0, L.THUMB_TIP).y + landmarkToCanvas(h0, L.INDEX_TIP).y) / 2;
+  const p1x = (landmarkToCanvas(h1, L.THUMB_TIP).x + landmarkToCanvas(h1, L.INDEX_TIP).x) / 2;
+  const p1y = (landmarkToCanvas(h1, L.THUMB_TIP).y + landmarkToCanvas(h1, L.INDEX_TIP).y) / 2;
+  const currentDist = Math.hypot(p1x - p0x, p1y - p0y);
+  const cx = (p0x + p1x) / 2;
+  const cy = (p0y + p1y) / 2;
 
   if (state.gesture !== 'scaling') {
     if (state.currentStroke) finishStroke();
@@ -858,10 +864,10 @@ function handleScaling(results) {
 function processGestures(results) {
   state.latestResults = results;
 
-  // 双手缩放（最高优先级）
-  if (results?.landmarks?.length === 2) {
+  // 双手捏合缩放（最高优先级）
+  if (results?.landmarks?.length === 2 && results.handedness?.length === 2) {
     const h0 = results.landmarks[0], h1 = results.landmarks[1];
-    if (classifyHandGesture(h0) === 'indexPoint' && classifyHandGesture(h1) === 'indexPoint') {
+    if (classifyHandGesture(h0) === 'thumbIndexTogether' && classifyHandGesture(h1) === 'thumbIndexTogether') {
       handleScaling(results);
       if (state.gesture === 'scaling') return;
     }
@@ -877,7 +883,7 @@ function processGestures(results) {
   const handGestures = results.landmarks.map(lm => classifyHandGesture(lm));
   updateGestureState(handGestures, results);
 
-  // 食指指向（UI 选择）
+  // ☝️ 食指指向 → UI 选择（面板打开时）或写字（面板关闭时）
   if (state.gesture === 'pointing') {
     for (let i = 0; i < results.landmarks.length; i++) {
       if (handGestures[i] === 'indexPoint') {
@@ -888,8 +894,33 @@ function processGestures(results) {
     }
   }
 
-  // 写字 / 移动 / 橡皮擦
+  // ☝️ 食指写字
   if (state.gesture === 'writing') {
+    for (let i = 0; i < results.landmarks.length; i++) {
+      if (handGestures[i] === 'indexPoint') {
+        const lm = results.landmarks[i];
+        const tip = landmarkToCanvas(lm, L.INDEX_TIP);
+        const worldPt = screenToWorld(tip.x, tip.y);
+
+        if (state.tool === 'eraser') {
+          if (state.currentStroke) finishStroke();
+          eraseAt(tip.x, tip.y);
+        } else {
+          if (!state.currentStroke) {
+            startStroke(worldPt, state.color, CONFIG.SIZE_VALUES[state.sizeIdx], 'pen');
+          } else {
+            const lastPt = state.currentStroke.points[state.currentStroke.points.length-1];
+            const d = Math.hypot(worldPt.x - lastPt.x, worldPt.y - lastPt.y);
+            if (d > 2) addPointToStroke(worldPt);
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // 🤏 捏合移动笔迹
+  if (state.gesture === 'moving') {
     for (let i = 0; i < results.landmarks.length; i++) {
       if (handGestures[i] === 'thumbIndexTogether') {
         const lm = results.landmarks[i];
@@ -899,34 +930,20 @@ function processGestures(results) {
         const my = (thumbTip.y + idxTip.y) / 2;
         const worldPt = screenToWorld(mx, my);
 
-        if (state.tool === 'eraser') {
-          if (state.currentStroke) finishStroke();
-          if (state.movingStrokes.length > 0) finishMoving();
-          eraseAt(mx, my);
-        } else if (state.movingStrokes.length > 0) {
-          // 继续移动已抓取的笔迹
+        if (state.movingStrokes.length > 0) {
+          // 继续移动
           updateMoving(worldPt.x, worldPt.y);
-        } else if (state.currentStroke) {
-          // 继续写字
-          const lastPt = state.currentStroke.points[state.currentStroke.points.length-1];
-          const d = Math.hypot(worldPt.x - lastPt.x, worldPt.y - lastPt.y);
-          if (d > 2) addPointToStroke(worldPt);
         } else {
-          // 新捏合 → 判断是写字还是移动
+          // 新捏合 → 抓取附近笔迹
           const nearbyIds = findNearbyStrokes(mx, my);
           if (nearbyIds.length > 0) {
-            // 抓取附近笔迹移动
             startMoving(nearbyIds, worldPt.x, worldPt.y);
-          } else {
-            // 开始写字
-            startStroke(worldPt, state.color, CONFIG.SIZE_VALUES[state.sizeIdx], 'pen');
           }
         }
         break;
       }
     }
-  } else if (state.gesture !== 'scaling') {
-    if (state.currentStroke && state.currentStroke.tool === 'pen') finishStroke();
+  } else if (state.gesture !== 'scaling' && state.gesture !== 'writing') {
     if (state.movingStrokes.length > 0) finishMoving();
   }
 
@@ -950,11 +967,13 @@ function updateHint() {
   } else if (state.uiOpen) {
     hintEl.textContent = '☝️ 食指悬停选择 | 🖐️ 张开手掌关闭菜单';
   } else if (state.movingStrokes.length > 0) {
-    hintEl.textContent = '✋ 移动中... 松开捏合放下';
+    hintEl.textContent = '✋ 捏合移动中... 松开放下';
   } else if (state.gesture === 'writing') {
-    hintEl.textContent = state.tool === 'eraser' ? '🧹 擦除中...' : '✍️ 写字中...';
+    hintEl.textContent = state.tool === 'eraser' ? '🧹 擦除中...' : '✍️ 食指写字中...';
+  } else if (state.gesture === 'moving') {
+    hintEl.textContent = '🤏 捏合抓取笔迹移动...';
   } else {
-    hintEl.textContent = '🖐️ 手掌→菜单 | 🤏 拇指+食指捏合→写字/移动 | 🤙 L形→消散 | ☝️☝️ 双食指→缩放';
+    hintEl.textContent = '🖐️ 手掌→菜单 | ☝️ 食指→写字 | 🤏 捏合→移动 | 🤙 L形→消散 | 🤏🤏 双手捏合→缩放';
   }
 }
 
@@ -970,17 +989,29 @@ function render() {
   renderUIPanel();
 
   // 画光标
-  if (state.latestResults?.landmarks && (state.gesture === 'writing' || state.gesture === 'pointing' || state.movingStrokes.length > 0)) {
-    for (let i = 0; i < state.latestResults.landmarks.length; i++) {
-      const g = classifyHandGesture(state.latestResults.landmarks[i]);
-      if (g === 'thumbIndexTogether' || g === 'indexPoint') {
+  if (state.latestResults?.landmarks) {
+    const gst = state.gesture;
+    if (gst === 'writing' || gst === 'pointing' || gst === 'moving' || state.movingStrokes.length > 0) {
+      for (let i = 0; i < state.latestResults.landmarks.length; i++) {
+        const g = classifyHandGesture(state.latestResults.landmarks[i]);
         const lm = state.latestResults.landmarks[i];
-        const thumbTip = landmarkToCanvas(lm, L.THUMB_TIP);
-        const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
-        const mx = (thumbTip.x + idxTip.x) / 2;
-        const my = (thumbTip.y + idxTip.y) / 2;
-        drawCursor({ x: mx, y: my });
-        break;
+
+        if (gst === 'writing' || gst === 'pointing') {
+          // 食指光标
+          if (g === 'indexPoint') {
+            const tip = landmarkToCanvas(lm, L.INDEX_TIP);
+            drawCursor({ x: tip.x, y: tip.y });
+            break;
+          }
+        } else if (gst === 'moving' || state.movingStrokes.length > 0) {
+          // 捏合光标
+          if (g === 'thumbIndexTogether') {
+            const thumbTip = landmarkToCanvas(lm, L.THUMB_TIP);
+            const idxTip = landmarkToCanvas(lm, L.INDEX_TIP);
+            drawCursor({ x: (thumbTip.x + idxTip.x) / 2, y: (thumbTip.y + idxTip.y) / 2 });
+            break;
+          }
+        }
       }
     }
   }
