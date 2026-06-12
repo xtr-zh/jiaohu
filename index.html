@@ -993,17 +993,46 @@ function render() {
 // ═══════════════════════════════════════════
 let handLandmarker = null;
 
+async function fetchWithProgress(url, label) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${label} 下载失败 (HTTP ${resp.status})`);
+  const total = parseInt(resp.headers.get('Content-Length') || '0');
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    if (total > 0) {
+      const pct = Math.round(loaded / total * 100);
+      const mb = (loaded / 1048576).toFixed(1);
+      const totalMb = (total / 1048576).toFixed(1);
+      loadingText.textContent = `${label} ${mb}/${totalMb}MB (${pct}%)`;
+    }
+  }
+  return new Blob(chunks);
+}
+
 async function initMediaPipe() {
-  loadingText.textContent = '加载 JS 模块...';
+  const startTime = performance.now();
+
+  loadingText.textContent = '加载 JS 模块 (140KB)...';
   const { HandLandmarker, FilesetResolver } = await import('./mediapipe/vision_bundle.mjs');
 
-  loadingText.textContent = '加载 WASM 运行时...';
+  loadingText.textContent = '下载 WASM 运行时 (9.5MB)...';
   const vision = await FilesetResolver.forVisionTasks('./mediapipe/wasm');
 
-  loadingText.textContent = '加载手势识别模型...';
+  loadingText.textContent = '加载手势识别模型 (7.8MB)...';
+
+  // 用 fetch 做下载进度
+  const modelBlob = await fetchWithProgress(CONFIG.MODEL_URL, '模型下载中');
+  const modelBuffer = await modelBlob.arrayBuffer();
+
   handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath: CONFIG.MODEL_URL,
+      modelAssetBuffer: modelBuffer,
       delegate: 'GPU',
     },
     runningMode: 'VIDEO',
@@ -1011,6 +1040,9 @@ async function initMediaPipe() {
     minHandDetectionConfidence: 0.7,
     minTrackingConfidence: 0.5,
   });
+
+  const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+  loadingText.textContent = `模型就绪！耗时 ${elapsed}s`;
 }
 
 // ═══════════════════════════════════════════
